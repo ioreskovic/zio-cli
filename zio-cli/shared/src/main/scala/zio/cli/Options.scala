@@ -16,11 +16,11 @@ import java.time.{
   ZoneOffset => JZoneOffset,
   ZonedDateTime => JZonedDateTime
 }
-
-import zio.IO
+import zio.{ IO, URIO, ZIO }
 import zio.cli.HelpDoc.Span
 import zio.cli.HelpDoc.{ blocks, p }
 import zio.cli.HelpDoc.Span._
+import zio.console.{ putStrLn, Console }
 
 import scala.collection.immutable.Nil
 
@@ -115,13 +115,13 @@ sealed trait Options[+A] { self =>
   private[cli] def modifySingle(f: SingleModifier): Options[A]
 
   private[cli] def foldSingle[C](initial: C)(f: (C, Single[_]) => C): C = self match {
-    case _: Options.Empty.type                   => initial
-    case s @ Single(_, _, _, _)                  => f(initial, s)
-    case cons: Options.Cons[a, b]                => cons.right.foldSingle(cons.left.foldSingle(initial)(f))(f)
-    case Options.Requires(options, target, _)    => options.foldSingle(initial)(f)
-    case Options.RequiresNot(options, target, _) => options.foldSingle(initial)(f)
-    case Options.Map(value, _)                   => value.foldSingle(initial)(f)
-    case Options.WithDefault(value, _, _)        => value.foldSingle(initial)(f)
+    case _: Options.Empty.type              => initial
+    case s @ Single(_, _, _, _)             => f(initial, s)
+    case cons: Options.Cons[a, b]           => cons.right.foldSingle(cons.left.foldSingle(initial)(f))(f)
+    case Options.Requires(options, _, _)    => options.foldSingle(initial)(f)
+    case Options.RequiresNot(options, _, _) => options.foldSingle(initial)(f)
+    case Options.Map(value, _)              => value.foldSingle(initial)(f)
+    case Options.WithDefault(value, _, _)   => value.foldSingle(initial)(f)
   }
 
   private[cli] def supports(arg: String, conf: CliConfig) =
@@ -131,6 +131,29 @@ sealed trait Options[+A] { self =>
           single.aliases
             .map("-" + conf.normalizeCase(_))
             .contains(arg)
+    }
+
+  private val wizardStart: ZIO[Console, Throwable, List[String]] =
+    putStrLn("=" * 100) *> putStrLn("Options:").as(Nil)
+
+  def wizard: ZIO[Console, Throwable, List[String]] =
+    foldSingle(wizardStart) {
+      case (c, o) =>
+        c.zipWith(
+          Wizard.prompt(o.synopsis).flatMap {
+            case Nil => URIO(Nil)
+            case head :: tail =>
+              o.primType match {
+                case b @ PrimType.Bool(_) =>
+                  b.validate(head)
+                    .bimap(
+                      new IllegalArgumentException(_),
+                      p => if (p) List(o.fullname) else Nil
+                    )
+                case _ => URIO(o.fullname :: head :: tail)
+              }
+          }
+        )(_ ++ _)
     }
 }
 
@@ -157,7 +180,7 @@ object Options {
   final case class WithDefault[A](options: Options[A], default: A, defaultDescription: String) extends Options[A] {
     def recognizes(value: String, conf: CliConfig): Option[Int] = options.recognizes(value, conf)
 
-    def synopsis: UsageSynopsis = options.synopsis
+    def synopsis: UsageSynopsis = UsageSynopsis.Optional(options.synopsis)
 
     def validate(args: List[String], conf: CliConfig): IO[HelpDoc, (List[String], A)] =
       options.validate(args, conf) orElseSucceed (args -> default)
@@ -183,7 +206,7 @@ object Options {
     description: HelpDoc = HelpDoc.Empty
   ) extends Options[A] { self =>
 
-    override def modifySingle(f: SingleModifier): Options[A] = f(self)
+    override def modifySingle(f: SingleModifier): Single[A] = f(self)
 
     def recognizes(value: String, conf: CliConfig): Option[Int] =
       if (supports(value, conf)) Some(1) else None
@@ -195,7 +218,8 @@ object Options {
       args match {
         case head :: tail if supports(head, conf) =>
           primType match {
-            case _: PrimType.Bool => primType.validate(None, conf).bimap(f => p(f), tail -> _)
+            case _: PrimType.Bool =>
+              primType.validate(None, conf).bimap(f => p(f), tail -> _)
             case _ =>
               (tail match {
                 case Nil         => primType.validate(None, conf)
@@ -215,7 +239,7 @@ object Options {
 
     def uid = Some(fullname)
 
-    private def fullname: String = (if (name.length == 1) "-" else "--") + name
+    private[cli] def fullname: String = (if (name.length == 1) "-" else "--") + name
 
     override def helpDoc: HelpDoc = {
 

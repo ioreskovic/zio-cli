@@ -11,10 +11,10 @@ import zio.{ App, URIO, ZIO }
 
 object WcApp extends App {
 
-  val bytesFlag: Options[Boolean] = Options.bool("c", true)
-  val linesFlag: Options[Boolean] = Options.bool("l", true)
-  val wordsFlag: Options[Boolean] = Options.bool("w", true)
-  val charFlag: Options[Boolean]  = Options.bool("m", false)
+  val bytesFlag: Options[Boolean] = Options.bool("c", true) ?? "Count bytes"
+  val linesFlag: Options[Boolean] = Options.bool("l", true) ?? "Count lines"
+  val wordsFlag: Options[Boolean] = Options.bool("w", true) ?? "Count words"
+  val charFlag: Options[Boolean]  = Options.bool("m", false) ?? "Count characters"
 
   case class WcOptions(bytes: Boolean, lines: Boolean, words: Boolean, char: Boolean)
   case class WcResult(

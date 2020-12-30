@@ -1,7 +1,10 @@
 package zio.cli
 
-import java.nio.file.{ Path => JPath }
+import zio.cli.HelpDoc.Span
+import zio.console.Console
+import zio.{ IO, ZIO }
 
+import java.nio.file.{ Path => JPath }
 import java.time.{
   Instant => JInstant,
   LocalDate => JLocalDate,
@@ -17,14 +20,13 @@ import java.time.{
   ZoneOffset => JZoneOffset,
   ZonedDateTime => JZonedDateTime
 }
-
-import zio.IO
-import zio.cli.HelpDoc.Span
+import scala.collection.immutable.Nil
 
 /**
  * A `Args` represents arguments that can be passed to a command-line application.
  */
 sealed trait Args[+A] { self =>
+  import Args.Single
 
   final def ++[That, A1 >: A](that: Args[That]): Args.Cons[A1, That] =
     Args.Cons(self, that)
@@ -63,6 +65,19 @@ sealed trait Args[+A] { self =>
   def synopsis: UsageSynopsis
 
   def validate(args: List[String], conf: CliConfig): IO[HelpDoc, (List[String], A)]
+
+  private[cli] def foldSingle[C](initial: C)(f: (C, Single[_]) => C): C = self match {
+    case _: Args.Empty.type    => initial
+    case s @ Single(_, _, _)   => f(initial, s)
+    case cons: Args.Cons[a, b] => cons.tail.foldSingle(cons.head.foldSingle(initial)(f))(f)
+    case v: Args.Variadic[a]   => v.value.foldSingle(initial)(f)
+    case m: Args.Map[a, b]     => m.value.foldSingle(initial)(f)
+  }
+
+  private val wizardStart: ZIO[Console, Throwable, List[String]] = ZIO.succeedNow(Nil)
+
+  def wizard: ZIO[Console, Throwable, List[String]] =
+    foldSingle(wizardStart)((c, o) => c.zipWith(Wizard.prompt(o.synopsis))(_ ++ _))
 }
 
 object Args {

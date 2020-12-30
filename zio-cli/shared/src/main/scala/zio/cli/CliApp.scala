@@ -19,12 +19,13 @@ final case class CliApp[-R, +E, Model](
   footer: HelpDoc = HelpDoc.Empty,
   config: CliConfig = CliConfig.default
 ) { self =>
-  def handleBuiltIn(args: List[String], builtIn: BuiltIn): ZIO[Console, Nothing, Unit] =
-    if (args.isEmpty || builtIn.help) printDocs(helpDoc)
+  def handleBuiltIn(args: List[String], builtIn: BuiltIn): ZIO[Console, HelpDoc, List[String]] =
+    if (args.isEmpty || builtIn.help) printDocs(helpDoc).as(List.empty[String])
+    else if (builtIn.wizard) wizard
     else
       builtIn.shellCompletions match {
-        case None        => IO.unit
-        case Some(value) => putStrLn(completions(value))
+        case None        => URIO.succeedNow(List.empty[String])
+        case Some(value) => putStrLn(completions(value)).as(List.empty[String])
       }
 
   def completions(shellType: ShellType): String = ???
@@ -47,8 +48,8 @@ final case class CliApp[-R, +E, Model](
     (for {
       builtInValidationResult  <- command.parseBuiltIn(args, config)
       (remainingArgs, builtIn) = builtInValidationResult
-      _                        <- handleBuiltIn(args, builtIn)
-      validationResult         <- command.parse(remainingArgs, config)
+      wizardArgs               <- handleBuiltIn(args, builtIn)
+      validationResult         <- command.parse(remainingArgs ++ wizardArgs, config)
     } yield validationResult)
       .foldM(printDocs, success => execute(success._2))
       .exitCode
@@ -58,4 +59,19 @@ final case class CliApp[-R, +E, Model](
 
   def summary(s: HelpDoc.Span): CliApp[R, E, Model] =
     copy(summary = self.summary + s)
+
+  private def wizard: ZIO[Console, HelpDoc, List[String]] =
+    putStrLn("=" * 100) *>
+      putStrLn(s"Welcome to $name wizard. Please select a command.") *>
+      command.wizard.mapError(e => HelpDoc.h1("Something went wrong.") + HelpDoc.p(e.getMessage)) >>=
+      dryRun
+
+  private def dryRun(commandString: List[String]): URIO[Console, List[String]] =
+    putStrLn(
+      HelpDoc
+        .p("You may bypass the wizard and execute your command directly with the following options and arguments:")
+        .toPlaintext()
+    ) *>
+      putStrLn(commandString.mkString(" ")) *>
+      URIO.succeed(commandString)
 }

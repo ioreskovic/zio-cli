@@ -1,9 +1,8 @@
 package zio.cli
 
-import zio.cli.Command.BuiltIn
-import zio.{ IO, ZIO }
-import zio.cli.HelpDoc.h1
-import zio.cli.HelpDoc.Span
+import zio.cli.HelpDoc.{ h1, Span }
+import zio.console.{ getStrLn, putStr, putStrLn, Console }
+import zio.{ IO, URIO, ZIO }
 
 /**
  * A `Command` represents a command in a command-line application. Every command-line application
@@ -11,6 +10,8 @@ import zio.cli.HelpDoc.Span
  * support multiple commands.
  */
 sealed trait Command[+A] { self =>
+  import Command._
+
   final def |[A1 >: A](that: Command[A1]): Command[A1] = Command.Fallback(self, that)
 
   final def as[B](b: => B): Command[B] = self.map(_ => b)
@@ -30,17 +31,59 @@ sealed trait Command[+A] { self =>
   final def subcommands[B](c1: Command[B], c2: Command[B], cs: Command[B]*): Command[(A, B)] =
     subcommands(cs.foldLeft(c1 | c2)(_ | _))
 
+  private[cli] def foldSingle[C](initial: C)(f: (C, Single[_, _]) => C): C = self match {
+    case c: Command.Single[o, a]      => f(initial, c)
+    case map: Command.Map[a, b]       => map.command.foldSingle(initial)(f)
+    case Fallback(left, right)        => right.foldSingle(left.foldSingle(initial)(f))(f)
+    case s: Command.Subcommands[a, b] => s.child.foldSingle(s.parent.foldSingle(initial)(f))(f)
+  }
+
   def synopsis: UsageSynopsis
 
   lazy val builtInOptions: Options[BuiltIn] =
-    (Options.bool("help", ifPresent = true) :: ShellType.option.optional("N/A")).as(BuiltIn)
+    (Options.bool("help", ifPresent = true) :: Options.bool("wizard", ifPresent = true) :: ShellType.option.optional(
+      "N/A"
+    )).as(BuiltIn)
 
   final def parseBuiltIn(args: List[String], conf: CliConfig): IO[HelpDoc, (List[String], BuiltIn)] =
     builtInOptions.validate(args, conf)
+
+  def wizard: ZIO[Console, Throwable, List[String]] =
+    showCommands()
+      .flatMap(max => selectCommand(max))
+      .flatMap(sel => wizardInternal(sel)(1))
+
+  private[cli] def showCommands(ctx: ShowContext = ShowContext(1, 1)): URIO[Console, Int] = self match {
+    case c: Command.Single[o, a] => putStrLn(String.format("[%2d]%s%s", ctx.ord, "  " * ctx.level, c.name)).as(ctx.ord)
+    case Command.Map(command, _) => command.showCommands(ctx)
+    case Command.Fallback(left, right) =>
+      left.showCommands(ctx) *> right.showCommands(ctx.next)
+    case s: Command.Subcommands[a, b] =>
+      s.parent.showCommands(ctx) *> s.child.showCommands(ctx.next.nest)
+  }
+
+  private[cli] def selectCommand(max: Int): ZIO[Console, Throwable, Int] =
+    putStr(s"Please select command: ") *>
+      getStrLn
+        .flatMap(in => ZIO.effect(in.toInt))
+        .orElseFail(new IllegalArgumentException("Not a valid command identifier"))
+        .filterOrFail(i => i >= 1 && i <= max)(
+          new IllegalArgumentException(s"Command selection not in range [1, $max].")
+        )
+
+  private[cli] def wizardInternal(target: Int)(current: Int): ZIO[Console, Throwable, List[String]]
 }
 
 object Command {
-  final case class BuiltIn(help: Boolean, shellCompletions: Option[ShellType])
+  final case class BuiltIn(help: Boolean, wizard: Boolean, shellCompletions: Option[ShellType])
+  final case class NonRequestedSelection(idx: Int) extends Throwable
+
+  final case class ShowContext(ord: Int, level: Int) {
+    def next: ShowContext   = ShowContext(ord + 1, level)
+    def prev: ShowContext   = ShowContext(ord - 1, level)
+    def nest: ShowContext   = ShowContext(ord, level + 1)
+    def unnest: ShowContext = ShowContext(ord, level - 1)
+  }
 
   final case class Single[OptionsType, ArgsType](
     name: String,
@@ -90,6 +133,12 @@ object Command {
     def synopsis: UsageSynopsis =
       UsageSynopsis.Named(name, None) + options.synopsis + args.synopsis
 
+    override def wizardInternal(target: Int)(current: Int): ZIO[Console, Throwable, List[String]] =
+      ZIO.when(current != target)(ZIO.fail(NonRequestedSelection(current))) *>
+        putStrLn("=" * 100) *>
+        putStrLn(s"Selected command: $name") *>
+        Wizard.show(synopsis) *>
+        options.wizard.zipWith(args.wizard)(_ ++ _)
   }
 
   final case class Map[A, B](command: Command[A], f: A => B) extends Command[B] {
@@ -103,7 +152,11 @@ object Command {
     }
 
     def synopsis: UsageSynopsis = command.synopsis
+
+    override def wizardInternal(target: Int)(current: Int): ZIO[Console, Throwable, List[String]] =
+      command.wizardInternal(target)(current)
   }
+
   final case class Fallback[A](left: Command[A], right: Command[A]) extends Command[A] {
     def helpDoc = left.helpDoc + right.helpDoc
 
@@ -113,7 +166,13 @@ object Command {
     ): IO[HelpDoc, (List[String], A)] = left.parse(args, conf) orElse right.parse(args, conf)
 
     def synopsis: UsageSynopsis = UsageSynopsis.Mixed
+
+    override def wizardInternal(target: Int)(current: Int): ZIO[Console, Throwable, List[String]] =
+      left
+        .wizardInternal(target)(current)
+        .catchSome { case NonRequestedSelection(idx) => right.wizardInternal(target)(idx) }
   }
+
   final case class Subcommands[A, B](parent: Command[A], child: Command[B]) extends Command[(A, B)] {
     def helpDoc = parent.helpDoc + h1("subcommands") + child.helpDoc
 
@@ -125,6 +184,11 @@ object Command {
     }
 
     def synopsis: UsageSynopsis = parent.synopsis
+
+    override def wizardInternal(target: Int)(current: Int): ZIO[Console, Throwable, List[String]] =
+      parent
+        .wizardInternal(target)(current)
+        .catchSome { case NonRequestedSelection(idx) => child.wizardInternal(target)(idx) }
   }
 
   /**
