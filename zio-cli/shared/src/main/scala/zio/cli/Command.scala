@@ -48,18 +48,21 @@ sealed trait Command[+A] { self =>
   final def parseBuiltIn(args: List[String], conf: CliConfig): IO[HelpDoc, (List[String], BuiltIn)] =
     builtInOptions.validate(args, conf)
 
-  def wizard: ZIO[Console, Throwable, List[String]] =
+  def wizard: ZIO[Console, Throwable, InvocationContext] =
     showCommands()
-      .flatMap(max => selectCommand(max))
+      .flatMap(max => selectCommand(max.ord))
       .flatMap(sel => wizardInternal(sel)(1))
 
-  private[cli] def showCommands(ctx: ShowContext = ShowContext(1, 1)): URIO[Console, Int] = self match {
-    case c: Command.Single[o, a] => putStrLn(String.format("[%2d]%s%s", ctx.ord, "  " * ctx.level, c.name)).as(ctx.ord)
+  private[cli] def showCommands(ctx: ShowContext = ShowContext()): URIO[Console, ShowContext] = self match {
+    case c: Command.Single[o, a] => {
+      val ctx1 = ctx ~ c.name
+      putStrLn(ctx1.toString).as(ctx1)
+    }
     case Command.Map(command, _) => command.showCommands(ctx)
     case Command.Fallback(left, right) =>
-      left.showCommands(ctx) *> right.showCommands(ctx.next)
+      left.showCommands(ctx).flatMap(cl => right.showCommands(cl.next.copy(path = ctx.path)))
     case s: Command.Subcommands[a, b] =>
-      s.parent.showCommands(ctx) *> s.child.showCommands(ctx.next.nest)
+      s.parent.showCommands(ctx).flatMap(cl => s.child.showCommands(cl.next))
   }
 
   private[cli] def selectCommand(max: Int): ZIO[Console, Throwable, Int] =
@@ -71,18 +74,28 @@ sealed trait Command[+A] { self =>
           new IllegalArgumentException(s"Command selection not in range [1, $max].")
         )
 
-  private[cli] def wizardInternal(target: Int)(current: Int): ZIO[Console, Throwable, List[String]]
+  private[cli] def wizardInternal(target: Int)(current: Int): ZIO[Console, Throwable, InvocationContext]
+
 }
 
 object Command {
   final case class BuiltIn(help: Boolean, wizard: Boolean, shellCompletions: Option[ShellType])
-  final case class NonRequestedSelection(idx: Int) extends Throwable
+  final case class NonRequestedSelection(idx: Int, cmdPath: List[String] = Nil) extends Throwable
 
-  final case class ShowContext(ord: Int, level: Int) {
-    def next: ShowContext   = ShowContext(ord + 1, level)
-    def prev: ShowContext   = ShowContext(ord - 1, level)
-    def nest: ShowContext   = ShowContext(ord, level + 1)
-    def unnest: ShowContext = ShowContext(ord, level - 1)
+  final case class ShowContext(ord: Int = 1, path: Vector[String] = Vector.empty) {
+    def set(x: Int): ShowContext       = ShowContext(x, path)
+    def next: ShowContext              = ShowContext(ord + 1, path)
+    def prev: ShowContext              = ShowContext(ord - 1, path)
+    def ~(seg: String): ShowContext    = ShowContext(ord, path :+ seg)
+    override lazy val toString: String = String.format("[%2d] %s", ord, path.mkString(" "))
+  }
+
+  final case class InvocationContext(commandPath: List[String], optsArgs: List[String]) {
+    def :+(seg: String): InvocationContext             = InvocationContext(commandPath :+ seg, optsArgs)
+    def +:(seg: String): InvocationContext             = InvocationContext(seg +: commandPath, optsArgs)
+    def ++:(segments: List[String]): InvocationContext = InvocationContext(segments ::: commandPath, optsArgs)
+    lazy val full: List[String]                        = commandPath ::: optsArgs
+    override lazy val toString: String                 = full.mkString(" ")
   }
 
   final case class Single[OptionsType, ArgsType](
@@ -133,12 +146,12 @@ object Command {
     def synopsis: UsageSynopsis =
       UsageSynopsis.Named(name, None) + options.synopsis + args.synopsis
 
-    override def wizardInternal(target: Int)(current: Int): ZIO[Console, Throwable, List[String]] =
-      ZIO.when(current != target)(ZIO.fail(NonRequestedSelection(current))) *>
+    override def wizardInternal(target: Int)(current: Int): ZIO[Console, Throwable, InvocationContext] =
+      ZIO.when(current != target)(ZIO.fail(NonRequestedSelection(current, List(name)))) *>
         putStrLn("=" * 100) *>
         putStrLn(s"Selected command: $name") *>
         Wizard.show(synopsis) *>
-        options.wizard.zipWith(args.wizard)(_ ++ _)
+        options.wizard.zipWith(args.wizard)(_ ++ _).map(InvocationContext(List(name), _))
   }
 
   final case class Map[A, B](command: Command[A], f: A => B) extends Command[B] {
@@ -153,7 +166,7 @@ object Command {
 
     def synopsis: UsageSynopsis = command.synopsis
 
-    override def wizardInternal(target: Int)(current: Int): ZIO[Console, Throwable, List[String]] =
+    override def wizardInternal(target: Int)(current: Int): ZIO[Console, Throwable, InvocationContext] =
       command.wizardInternal(target)(current)
   }
 
@@ -167,10 +180,10 @@ object Command {
 
     def synopsis: UsageSynopsis = UsageSynopsis.Mixed
 
-    override def wizardInternal(target: Int)(current: Int): ZIO[Console, Throwable, List[String]] =
+    override def wizardInternal(target: Int)(current: Int): ZIO[Console, Throwable, InvocationContext] =
       left
         .wizardInternal(target)(current)
-        .catchSome { case NonRequestedSelection(idx) => right.wizardInternal(target)(idx) }
+        .catchSome { case NonRequestedSelection(idx, _) => right.wizardInternal(target)(idx + 1) }
   }
 
   final case class Subcommands[A, B](parent: Command[A], child: Command[B]) extends Command[(A, B)] {
@@ -185,10 +198,13 @@ object Command {
 
     def synopsis: UsageSynopsis = parent.synopsis
 
-    override def wizardInternal(target: Int)(current: Int): ZIO[Console, Throwable, List[String]] =
+    override def wizardInternal(target: Int)(current: Int): ZIO[Console, Throwable, InvocationContext] =
       parent
         .wizardInternal(target)(current)
-        .catchSome { case NonRequestedSelection(idx) => child.wizardInternal(target)(idx) }
+        .catchSome {
+          case NonRequestedSelection(idx, cp) =>
+            child.wizardInternal(target)(idx + 1).map(ctx => cp ++: ctx)
+        }
   }
 
   /**

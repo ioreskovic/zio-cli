@@ -1,7 +1,7 @@
 package zio.cli
 
 import zio._
-import zio.cli.Command.BuiltIn
+import zio.cli.Command.{ BuiltIn, InvocationContext }
 import zio.console._
 import zio.cli.HelpDoc.{ h1, p }
 import zio.cli.HelpDoc.Span.text
@@ -21,7 +21,7 @@ final case class CliApp[-R, +E, Model](
 ) { self =>
   def handleBuiltIn(args: List[String], builtIn: BuiltIn): ZIO[Console, HelpDoc, List[String]] =
     if (args.isEmpty || builtIn.help) printDocs(helpDoc).as(List.empty[String])
-    else if (builtIn.wizard) wizard
+    else if (builtIn.wizard) wizard.map(_.full)
     else
       builtIn.shellCompletions match {
         case None        => URIO.succeedNow(List.empty[String])
@@ -49,7 +49,7 @@ final case class CliApp[-R, +E, Model](
       builtInValidationResult  <- command.parseBuiltIn(args, config)
       (remainingArgs, builtIn) = builtInValidationResult
       wizardArgs               <- handleBuiltIn(args, builtIn)
-      validationResult         <- command.parse(remainingArgs ++ wizardArgs, config)
+      validationResult         <- command.parse(remainingArgs ++ wizardArgs.tail, config)
     } yield validationResult)
       .foldM(printDocs, success => execute(success._2))
       .exitCode
@@ -60,18 +60,18 @@ final case class CliApp[-R, +E, Model](
   def summary(s: HelpDoc.Span): CliApp[R, E, Model] =
     copy(summary = self.summary + s)
 
-  private def wizard: ZIO[Console, HelpDoc, List[String]] =
+  private def wizard: ZIO[Console, HelpDoc, InvocationContext] =
     putStrLn("=" * 100) *>
       putStrLn(s"Welcome to $name wizard. Please select a command.") *>
       command.wizard.mapError(e => HelpDoc.h1("Something went wrong.") + HelpDoc.p(e.getMessage)) >>=
       dryRun
 
-  private def dryRun(commandString: List[String]): URIO[Console, List[String]] =
+  private def dryRun(invocation: InvocationContext): URIO[Console, InvocationContext] =
     putStrLn(
       HelpDoc
         .p("You may bypass the wizard and execute your command directly with the following options and arguments:")
         .toPlaintext()
     ) *>
-      putStrLn(commandString.mkString(" ")) *>
-      URIO.succeed(commandString)
+      putStrLn(invocation.toString) *>
+      URIO.succeed(invocation)
 }
