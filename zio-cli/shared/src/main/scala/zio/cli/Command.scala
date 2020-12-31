@@ -26,6 +26,8 @@ sealed trait Command[+A] { self =>
 
   def parse(args: List[String], conf: CliConfig): IO[HelpDoc, (List[String], A)]
 
+  def parseFull(inv: Invocation, conf: CliConfig): IO[HelpDoc, (Invocation, A)]
+
   final def subcommands[B](that: Command[B]): Command[(A, B)] = Command.Subcommands(self, that)
 
   final def subcommands[B](c1: Command[B], c2: Command[B], cs: Command[B]*): Command[(A, B)] =
@@ -48,7 +50,7 @@ sealed trait Command[+A] { self =>
   final def parseBuiltIn(args: List[String], conf: CliConfig): IO[HelpDoc, (List[String], BuiltIn)] =
     builtInOptions.validate(args, conf)
 
-  def wizard: ZIO[Console, Throwable, InvocationContext] =
+  def wizard: ZIO[Console, Throwable, Invocation] =
     showCommands()
       .flatMap(max => selectCommand(max.ord))
       .flatMap(sel => wizardInternal(sel)(1))
@@ -74,8 +76,7 @@ sealed trait Command[+A] { self =>
           new IllegalArgumentException(s"Command selection not in range [1, $max].")
         )
 
-  private[cli] def wizardInternal(target: Int)(current: Int): ZIO[Console, Throwable, InvocationContext]
-
+  private[cli] def wizardInternal(target: Int)(current: Int): ZIO[Console, Throwable, Invocation]
 }
 
 object Command {
@@ -90,12 +91,16 @@ object Command {
     override lazy val toString: String = String.format("[%2d] %s", ord, path.mkString(" "))
   }
 
-  final case class InvocationContext(commandPath: List[String], optsArgs: List[String]) {
-    def :+(seg: String): InvocationContext             = InvocationContext(commandPath :+ seg, optsArgs)
-    def +:(seg: String): InvocationContext             = InvocationContext(seg +: commandPath, optsArgs)
-    def ++:(segments: List[String]): InvocationContext = InvocationContext(segments ::: commandPath, optsArgs)
-    lazy val full: List[String]                        = commandPath ::: optsArgs
-    override lazy val toString: String                 = full.mkString(" ")
+  final case class Invocation(commandPath: List[String], optsArgs: List[String]) {
+    def :+(seg: String): Invocation             = Invocation(commandPath :+ seg, optsArgs)
+    def +:(seg: String): Invocation             = Invocation(seg +: commandPath, optsArgs)
+    def ++:(segments: List[String]): Invocation = Invocation(segments ::: commandPath, optsArgs)
+    lazy val full: List[String]                 = commandPath ::: optsArgs
+    override lazy val toString: String          = full.mkString(" ")
+  }
+
+  object Invocation {
+    val Empty: Invocation = Invocation(Nil, Nil)
   }
 
   final case class Single[OptionsType, ArgsType](
@@ -143,15 +148,47 @@ object Command {
             )
       } yield (args, (optionsType, argsType))
 
+    override def parseFull(
+      inv: Invocation,
+      conf: CliConfig
+    ): IO[HelpDoc, (Invocation, (OptionsType, ArgsType))] = {
+      def validated(cmdPath: List[String]) =
+        for {
+          tuple               <- self.options.validate(inv.optsArgs, conf)
+          (args, optionsType) = tuple
+          tuple               <- self.args.validate(args, conf)
+          (args, argsType)    = tuple
+        } yield (Invocation(cmdPath, args), (optionsType, argsType))
+
+      inv.commandPath match {
+        case head :: tail if head == name =>
+          validated(tail).flatMap {
+            case (i, (ot, at)) =>
+              tail match {
+                case Nil if i.optsArgs.nonEmpty =>
+                  ZIO.fail(HelpDoc.p(Span.error(s"Unexpected arguments for command ${name}: ${args}")))
+                case _ => IO.succeed((i, (ot, at)))
+              }
+          }
+        case Nil =>
+          validated(Nil)
+        case _ =>
+          ZIO.fail(
+            HelpDoc.p(Span.error(s"Invocation error for command $name")) +
+              HelpDoc.p(Span.error(s"Command path: ${inv.commandPath}, opts & args: ${inv.optsArgs}"))
+          )
+      }
+    }
+
     def synopsis: UsageSynopsis =
       UsageSynopsis.Named(name, None) + options.synopsis + args.synopsis
 
-    override def wizardInternal(target: Int)(current: Int): ZIO[Console, Throwable, InvocationContext] =
+    override def wizardInternal(target: Int)(current: Int): ZIO[Console, Throwable, Invocation] =
       ZIO.when(current != target)(ZIO.fail(NonRequestedSelection(current, List(name)))) *>
         putStrLn("=" * 100) *>
         putStrLn(s"Selected command: $name") *>
         Wizard.show(synopsis) *>
-        options.wizard.zipWith(args.wizard)(_ ++ _).map(InvocationContext(List(name), _))
+        options.wizard.zipWith(args.wizard)(_ ++ _).map(Invocation(List(name), _))
   }
 
   final case class Map[A, B](command: Command[A], f: A => B) extends Command[B] {
@@ -164,9 +201,14 @@ object Command {
       case (leftover, a) => (leftover, f(a))
     }
 
+    override def parseFull(inv: Invocation, conf: CliConfig): IO[HelpDoc, (Invocation, B)] =
+      command.parseFull(inv, conf).map {
+        case (leftover, a) => (leftover, f(a))
+      }
+
     def synopsis: UsageSynopsis = command.synopsis
 
-    override def wizardInternal(target: Int)(current: Int): ZIO[Console, Throwable, InvocationContext] =
+    override def wizardInternal(target: Int)(current: Int): ZIO[Console, Throwable, Invocation] =
       command.wizardInternal(target)(current)
   }
 
@@ -178,9 +220,12 @@ object Command {
       conf: CliConfig
     ): IO[HelpDoc, (List[String], A)] = left.parse(args, conf) orElse right.parse(args, conf)
 
+    override def parseFull(inv: Invocation, conf: CliConfig): IO[HelpDoc, (Invocation, A)] =
+      left.parseFull(inv, conf) orElse right.parseFull(inv, conf)
+
     def synopsis: UsageSynopsis = UsageSynopsis.Mixed
 
-    override def wizardInternal(target: Int)(current: Int): ZIO[Console, Throwable, InvocationContext] =
+    override def wizardInternal(target: Int)(current: Int): ZIO[Console, Throwable, Invocation] =
       left
         .wizardInternal(target)(current)
         .catchSome { case NonRequestedSelection(idx, _) => right.wizardInternal(target)(idx + 1) }
@@ -196,9 +241,14 @@ object Command {
       case (leftover, a) => child.parse(leftover, conf).map(t => (t._1, (a, t._2)))
     }
 
+    override def parseFull(inv: Invocation, conf: CliConfig): IO[HelpDoc, (Invocation, (A, B))] =
+      parent.parseFull(inv, conf).flatMap {
+        case (leftover, a) => child.parseFull(leftover, conf).map { case (leftover2, b) => (leftover2, (a, b)) }
+      }
+
     def synopsis: UsageSynopsis = parent.synopsis
 
-    override def wizardInternal(target: Int)(current: Int): ZIO[Console, Throwable, InvocationContext] =
+    override def wizardInternal(target: Int)(current: Int): ZIO[Console, Throwable, Invocation] =
       parent
         .wizardInternal(target)(current)
         .catchSome {
