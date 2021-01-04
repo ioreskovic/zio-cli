@@ -1,10 +1,10 @@
 package zio.cli
 
 import zio._
-import zio.cli.Command.{ BuiltIn, Invocation }
-import zio.console._
-import zio.cli.HelpDoc.{ h1, p }
+import zio.cli.Command.BuiltIn
 import zio.cli.HelpDoc.Span.text
+import zio.cli.HelpDoc.{ h1, p }
+import zio.console._
 
 /**
  * A `CliApp[R, E]` is a complete description of a command-line application, which
@@ -19,13 +19,13 @@ final case class CliApp[-R, +E, Model](
   footer: HelpDoc = HelpDoc.Empty,
   config: CliConfig = CliConfig.default
 ) { self =>
-  def handleBuiltIn(args: List[String], builtIn: BuiltIn): ZIO[Console, HelpDoc, Invocation] =
-    if (args.isEmpty || builtIn.help) printDocs(helpDoc).as(Invocation.Empty)
+  def handleBuiltIn(args: List[String], builtIn: BuiltIn): ZIO[Console, HelpDoc, List[String]] =
+    if (args.isEmpty || builtIn.help) printDocs(helpDoc).as(Nil)
     else if (builtIn.wizard) wizard
     else
       builtIn.shellCompletions match {
-        case None        => URIO.succeedNow(Invocation.Empty)
-        case Some(value) => putStrLn(completions(value)).as(Invocation.Empty)
+        case None        => URIO.succeedNow(Nil)
+        case Some(value) => putStrLn(completions(value)).as(Nil)
       }
 
   def completions(shellType: ShellType): String = ???
@@ -44,15 +44,12 @@ final case class CliApp[-R, +E, Model](
   def config(o: CliConfig): CliApp[R, E, Model] =
     copy(config = o)
 
-  def runFull(inv: Invocation): ZIO[R with Console, Nothing, ExitCode] =
+  def run(args: List[String]): ZIO[R with Console, Nothing, ExitCode] =
     (for {
-      builtInValidationResult  <- command.parseBuiltIn(inv.optsArgs, config)
+      builtInValidationResult  <- command.parseBuiltIn(args, config)
       (remainingArgs, builtIn) = builtInValidationResult
-      wizardInvocation         <- handleBuiltIn(inv.optsArgs, builtIn)
-      validationResult <- command.parseFull(
-                           wizardInvocation.copy(optsArgs = remainingArgs ::: wizardInvocation.optsArgs),
-                           config
-                         )
+      wizardArgs               <- handleBuiltIn(args, builtIn)
+      validationResult         <- command.parse(remainingArgs ++ wizardArgs, config)
     } yield validationResult)
       .foldM(printDocs, success => execute(success._2))
       .exitCode
@@ -63,18 +60,18 @@ final case class CliApp[-R, +E, Model](
   def summary(s: HelpDoc.Span): CliApp[R, E, Model] =
     copy(summary = self.summary + s)
 
-  private def wizard: ZIO[Console, HelpDoc, Invocation] =
+  private def wizard: ZIO[Console, HelpDoc, List[String]] =
     putStrLn("=" * 100) *>
       putStrLn(s"Welcome to $name wizard. Please select a command.") *>
       command.wizard.mapError(e => HelpDoc.h1("Something went wrong.") + HelpDoc.p(e.getMessage)) >>=
       dryRun
 
-  private def dryRun(invocation: Invocation): URIO[Console, Invocation] =
+  private def dryRun(args: List[String]): URIO[Console, List[String]] =
     putStrLn(
       HelpDoc
         .p("You may bypass the wizard and execute your command directly with the following options and arguments:")
         .toPlaintext()
     ) *>
-      putStrLn(invocation.toString) *>
-      URIO.succeed(invocation)
+      putStrLn(args.mkString(" ")) *>
+      URIO.succeed(args)
 }

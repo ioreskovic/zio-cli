@@ -2,7 +2,6 @@ package zio.cli.examples
 
 import java.nio.file.Path
 import zio.blocking.Blocking
-import zio.cli.Command.Invocation
 import zio.cli.HelpDoc.Span.text
 import zio.cli._
 import zio.console.{ putStrLn, Console }
@@ -93,5 +92,5 @@ object WcApp extends App {
   )
 
   @Override
-  def run(args: List[String]) = wcApp.runFull(Invocation(Nil, args))
+  def run(args: List[String]) = wcApp.run(args)
 }

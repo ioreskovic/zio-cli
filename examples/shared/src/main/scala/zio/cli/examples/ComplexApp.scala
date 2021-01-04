@@ -1,6 +1,5 @@
 package zio.cli.examples
 
-import zio.cli.Command.Invocation
 import zio.cli.HelpDoc.Span.text
 import zio.cli._
 import zio.console.{ putStrLn, Console }
@@ -30,5 +29,5 @@ object ComplexApp extends App {
     execute.tupled
   )
 
-  override def run(args: List[String]): ZIO[Console, Nothing, ExitCode] = app.runFull(Invocation(Nil, args))
+  override def run(args: List[String]): ZIO[Console, Nothing, ExitCode] = app.run(args)
 }
