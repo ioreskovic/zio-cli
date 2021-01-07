@@ -2,7 +2,7 @@ package zio.cli
 
 import zio.cli.HelpDoc.{ h1, Span }
 import zio.console.{ getStrLn, putStr, putStrLn, Console }
-import zio.{ IO, URIO, ZIO }
+import zio.{ IO, UIO, ZIO }
 
 import scala.collection.immutable.{ Map => ScalaMap }
 
@@ -28,6 +28,8 @@ sealed trait Command[+A] { self =>
 
   def parse(args: List[String], conf: CliConfig): IO[HelpDoc, (List[String], A)]
 
+  def parseInvocation(inv: Invocation, conf: CliConfig): IO[HelpDoc, (Invocation, A)]
+
   final def subcommands[B](that: Command[B]): Command[(A, B)] = Command.Subcommands(self, that)
 
   final def subcommands[B](c1: Command[B], c2: Command[B], cs: Command[B]*): Command[(A, B)] =
@@ -40,15 +42,6 @@ sealed trait Command[+A] { self =>
     case s: Command.Subcommands[a, b] => s.child.foldSingle(s.parent.foldSingle(initial)(f))(f)
   }
 
-  private[cli] def getCommand: ZIO[Any, Nothing, ScalaMap[Int, Single[_, _]]] =
-    foldSingle(ZIO.succeed(ScalaMap.empty[Int, Single[_, _]])) {
-      case (eff, cmd) =>
-        eff.map { acc =>
-          val key = acc.size + 1
-          acc + (key -> cmd)
-        }
-    }
-
   def synopsis: UsageSynopsis
 
   lazy val builtInOptions: Options[BuiltIn] =
@@ -59,45 +52,85 @@ sealed trait Command[+A] { self =>
   final def parseBuiltIn(args: List[String], conf: CliConfig): IO[HelpDoc, (List[String], BuiltIn)] =
     builtInOptions.validate(args, conf)
 
-  def wizard: ZIO[Console, Throwable, List[String]] =
-    showCommands()
-      .flatMap(max => selectCommand(max.ord))
-      .flatMap(sel => getCommand.map(cs => cs(sel)))
-      .tap(cmd => putStrLn(s"Selected command: ${cmd.name}"))
-      .flatMap(cmd => cmd.wizardInternal)
+  def wizard: ZIO[Console, Throwable, Invocation] =
+    for {
+      flattened <- flatten
+      _         <- flattened.render
+      cmdId     <- selectCommand(flattened.cmds.keySet)
+      sc        = flattened.cmds(cmdId)
+      args      <- sc.cmd.wizardInternal
+    } yield Invocation(sc.path, args)
 
-  private[cli] def showCommands(ctx: ShowContext = ShowContext()): URIO[Console, ShowContext] = self match {
-    case c: Command.Single[o, a] => {
-      val ctx1 = ctx ~ c.name
-      putStrLn(ctx1.toString).as(ctx1)
+  private[cli] def flatten: UIO[Commands] = flattenInternal()
+
+  private[cli] def flattenInternal(ctx: Commands = Commands()): UIO[Commands] =
+    self match {
+      case c: Command.Single[o, a] =>
+        ZIO.succeed(ctx ~ c.name).map(_.record(c))
+      case c: Command.Map[a, b] => c.command.flattenInternal(ctx)
+      case c: Command.Fallback[a] =>
+        for {
+          ctx2 <- c.left.flattenInternal(ctx)
+          ctx3 <- c.right.flattenInternal(ctx2.next.copy(path = ctx.path))
+        } yield ctx3
+      case c: Command.Subcommands[a, b] =>
+        for {
+          ctx2 <- c.parent.flattenInternal(ctx)
+          ctx3 <- c.child.flattenInternal(ctx2.next)
+        } yield ctx3
     }
-    case Command.Map(command, _) => command.showCommands(ctx)
-    case Command.Fallback(left, right) =>
-      left.showCommands(ctx).flatMap(cl => right.showCommands(cl.next.copy(path = ctx.path)))
-    case s: Command.Subcommands[a, b] =>
-      s.parent.showCommands(ctx).flatMap(cl => s.child.showCommands(cl.next))
-  }
 
-  private[cli] def selectCommand(max: Int): ZIO[Console, Throwable, Int] =
+  private[cli] def paths: UIO[List[List[String]]] = flatten.flatMap(_.paths)
+
+  private[cli] def selectCommand(cmdIds: Set[Int]): ZIO[Console, Throwable, Int] =
     putStr(s"Please select command: ") *>
       getStrLn
         .flatMap(in => ZIO.effect(in.toInt))
         .orElseFail(new IllegalArgumentException("Not a valid command identifier"))
-        .filterOrFail(i => i >= 1 && i <= max)(
-          new IllegalArgumentException(s"Command selection not in range [1, $max].")
+        .filterOrFail(cmdIds)(
+          new IllegalArgumentException(s"Unknown command identifier")
         )
 }
 
 object Command {
   final case class BuiltIn(help: Boolean, wizard: Boolean, shellCompletions: Option[ShellType])
   final case class NonRequestedSelection(idx: Int, cmdPath: List[String] = Nil) extends Throwable
+  final case class FlatCommand(ord: Int, path: List[String], cmd: Single[_, _]) {
+    lazy val mkString: String = String.format("[%2d] %s", ord, path.mkString(" "))
+  }
 
-  final case class ShowContext(ord: Int = 1, path: Vector[String] = Vector.empty) {
-    def set(x: Int): ShowContext       = ShowContext(x, path)
-    def next: ShowContext              = ShowContext(ord + 1, path)
-    def prev: ShowContext              = ShowContext(ord - 1, path)
-    def ~(seg: String): ShowContext    = ShowContext(ord, path :+ seg)
-    override lazy val toString: String = String.format("[%2d] %s", ord, path.mkString(" "))
+  final case class Commands(
+    ord: Int = 1,
+    path: Vector[String] = Vector.empty,
+    cmds: ScalaMap[Int, FlatCommand] = ScalaMap.empty
+  ) {
+    def next: Commands           = Commands(ord + 1, path, cmds)
+    def ~(seg: String): Commands = Commands(ord, path :+ seg, cmds)
+    def record(s: Single[_, _]): Commands =
+      Commands(ord, path, cmds + (ord -> FlatCommand(ord, path.toList, s)))
+    def current: FlatCommand = cmds(ord)
+    def render: ZIO[Console, Nothing, Unit] =
+      ZIO.foreach(cmds.values.toList.sortBy(_.ord))(fc => putStrLn(fc.mkString)).unit
+
+    def paths: UIO[List[List[String]]] =
+      ZIO
+        .succeedNow(cmds.values.toList)
+        .map(_.sortBy(_.ord))
+        .map(_.map(_.path))
+  }
+
+  final case class Invocation(cmdPath: List[String], optsArgs: List[String]) {
+    lazy val mkString: String = (cmdPath ::: optsArgs).mkString(" ")
+  }
+
+  object Invocation {
+    val empty: Invocation = Invocation(Nil, Nil)
+  }
+
+  final case class InvocationContext(current: Vector[String] = Vector.empty, paths: List[List[String]] = Nil) {
+    def ~(seg: String): InvocationContext          = InvocationContext(current :+ seg, paths)
+    def record: InvocationContext                  = InvocationContext(current, current.toList :: paths)
+    def path(p: Vector[String]): InvocationContext = InvocationContext(p, paths)
   }
 
   final case class Single[OptionsType, ArgsType](
@@ -145,6 +178,28 @@ object Command {
             )
       } yield (args, (optionsType, argsType))
 
+    override def parseInvocation(
+      inv: Invocation,
+      conf: CliConfig
+    ): IO[HelpDoc, (Invocation, (OptionsType, ArgsType))] = {
+      def validate(cTail: List[String], args: List[String]) =
+        for {
+          tuple               <- self.options.validate(args, conf)
+          (args, optionsType) = tuple
+          tuple               <- self.args.validate(args, conf)
+          (args, argsType)    = tuple
+          _ <- ZIO.when(cTail.isEmpty && args.nonEmpty)(
+                ZIO.fail(HelpDoc.p(Span.error(s"Unexpected arguments for command $name: $args")))
+              )
+        } yield (Invocation(cTail, args), (optionsType, argsType))
+
+      inv.cmdPath match {
+        case cHead :: cTail if cHead == name => validate(cTail, inv.optsArgs)
+        case Nil                             => validate(Nil, Nil)
+        case _                               => ZIO.fail(HelpDoc.p(Span.error(s"Bad invocation for command $name: ${inv.mkString}")))
+      }
+    }
+
     def synopsis: UsageSynopsis =
       UsageSynopsis.Named(name, None) + options.synopsis + args.synopsis
 
@@ -165,6 +220,11 @@ object Command {
       case (leftover, a) => (leftover, f(a))
     }
 
+    override def parseInvocation(inv: Invocation, conf: CliConfig): IO[HelpDoc, (Invocation, B)] =
+      command.parseInvocation(inv, conf).map {
+        case (leftover, a) => (leftover, f(a))
+      }
+
     def synopsis: UsageSynopsis = command.synopsis
   }
 
@@ -175,6 +235,9 @@ object Command {
       args: List[String],
       conf: CliConfig
     ): IO[HelpDoc, (List[String], A)] = left.parse(args, conf) orElse right.parse(args, conf)
+
+    override def parseInvocation(inv: Invocation, conf: CliConfig): IO[HelpDoc, (Invocation, A)] =
+      left.parseInvocation(inv, conf) orElse right.parseInvocation(inv, conf)
 
     def synopsis: UsageSynopsis = UsageSynopsis.Mixed
   }
@@ -188,6 +251,14 @@ object Command {
     ): IO[HelpDoc, (List[String], (A, B))] = parent.parse(args, conf).flatMap {
       case (leftover, a) => child.parse(leftover, conf).map(t => (t._1, (a, t._2)))
     }
+
+    override def parseInvocation(inv: Invocation, conf: CliConfig): IO[HelpDoc, (Invocation, (A, B))] =
+      for {
+        parentResult        <- parent.parseInvocation(inv, conf)
+        (parentLeftover, a) = parentResult
+        childResult         <- child.parseInvocation(parentLeftover, conf)
+        (childLeftover, b)  = childResult
+      } yield (childLeftover, (a, b))
 
     def synopsis: UsageSynopsis = parent.synopsis
   }

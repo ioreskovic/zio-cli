@@ -50,6 +50,12 @@ sealed trait Options[+A] { self =>
 
   //TODO : spend time to understand usage of implicit here
 
+  final def as[Z](f: => Z): Options[Z] =
+    self.map(_ => f)
+
+  final def as[B, Z](f: B => Z)(implicit ev: A <:< B): Options[Z] =
+    self.map(ev).map(b => f(b))
+
   final def as[B, C, Z](f: (B, C) => Z)(implicit ev: A <:< ((B, C))): Options[Z] =
     self.map(ev).map { case ((b, c)) => f(b, c) }
 
