@@ -1,5 +1,10 @@
 package zio.cli
 
+import zio.cli.HelpDoc.Span._
+import zio.cli.HelpDoc.{ p, Span }
+import zio.console.{ putStrLn, Console }
+import zio.{ IO, URIO, ZIO }
+
 import java.nio.file.{ Path => JPath }
 import java.time.{
   Instant => JInstant,
@@ -16,12 +21,6 @@ import java.time.{
   ZoneOffset => JZoneOffset,
   ZonedDateTime => JZonedDateTime
 }
-import zio.{ IO, URIO, ZIO }
-import zio.cli.HelpDoc.Span
-import zio.cli.HelpDoc.{ blocks, p }
-import zio.cli.HelpDoc.Span._
-import zio.console.{ putStrLn, Console }
-
 import scala.collection.immutable.Nil
 
 /**
@@ -177,12 +176,6 @@ sealed trait Options[+A] { self =>
 
   def recognizes(value: String, conf: CliConfig): Option[Int]
 
-  final def requires[B](that: Options[B], suchThat: B => Boolean = (_: B) => true): Options[A] =
-    Options.Requires(self, that, suchThat)
-
-  final def requiresNot[B](that: Options[B], suchThat: B => Boolean = (_: B) => true): Options[A] =
-    Options.RequiresNot(self, that, suchThat)
-
   def synopsis: UsageSynopsis
 
   def uid: Option[String]
@@ -318,7 +311,7 @@ object Options {
 
     def uid = Some(fullname)
 
-    private def fullname: String = (if (name.length == 1) "-" else "--") + name
+    private[cli] def fullname: String = (if (name.length == 1) "-" else "--") + name
 
     override def helpDoc: HelpDoc = {
 
