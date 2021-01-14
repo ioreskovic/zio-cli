@@ -43,11 +43,7 @@ object ComplexApp extends App {
 
   val gitFull: Command[((GitOptions, Unit), (Object, Serializable))] =
     git.subcommands(
-      gitStash
-        .subcommands(
-          gitStashPush,
-          gitStashClear
-        ),
+      gitStashFull,
       gitPush
     )
 
